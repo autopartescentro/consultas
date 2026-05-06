@@ -1,534 +1,643 @@
-import os, re, json, base64, urllib.parse
-from io import BytesIO
+
+import re
+import io
+import json
+import base64
+import urllib.parse
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from rapidfuzz import fuzz
+from PIL import Image
 from openai import OpenAI
 
-st.set_page_config(page_title="IA Vidrios - Autopartes Centro", page_icon="🚗", layout="centered")
-st.title("🚗 Buscador IA de vidrios")
-st.caption("Sacá o subí una foto, elegí el tipo de vidrio y compará precios entre proveedores ya cargados.")
-st.success("🌐 Versión online lista: usá cámara o subí foto desde el celular.")
 
-
-LISTAS_DIR = "listas_precios"
-
-# API Key fija: se lee automáticamente desde .streamlit/secrets.toml o desde variable de entorno.
-def get_api_key():
-    try:
-        key = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        key = ""
-    return key or os.getenv("OPENAI_API_KEY", "")
-
-api_key = get_api_key()
-if api_key:
-    st.sidebar.success("🔑 API Key cargada automáticamente")
-else:
-    st.sidebar.error("Falta API Key fija")
-    st.sidebar.caption('Cargá OPENAI_API_KEY en los Secrets de Streamlit Cloud')
-
-pieza = st.selectbox(
-    "¿Qué querés buscar?",
-    ["Parabrisas", "Vidrio de puerta / lateral", "Luneta", "Todos los vidrios"],
+st.set_page_config(
+    page_title="IA Vidrios - Autopartes Centro",
+    page_icon="🚘",
+    layout="centered"
 )
 
-st.subheader("📋 Listas de precios fijas")
-st.caption("La app carga automáticamente todos los Excel que estén dentro de la carpeta 'listas_precios'. El nombre del archivo se usa como nombre del proveedor.")
+WHATSAPP_NUMERO = "5493571636868"
+LISTAS_DIR = Path("listas_precios")
+COLOCACION_FILE = LISTAS_DIR / "listas_colocacion.xlsx"
+LOGO_PATH = Path("assets/logo_ac.jpeg")
 
-modo_foto = st.radio("Foto del auto", ["Subir foto", "Sacar foto con cámara"], horizontal=True)
-if modo_foto == "Sacar foto con cámara":
-    image_file = st.camera_input("Sacá una foto del auto")
-else:
-    image_file = st.file_uploader("Subí una foto del auto", type=["jpg", "jpeg", "png", "webp"])
 
-@st.cache_data
-def load_excel_from_bytes(data: bytes):
-    # Admite listas simples donde las primeras 3 columnas sean código/descripcion/precio.
-    # Si tiene encabezados, intenta encontrarlos. Si no, usa las primeras 3 columnas.
-    raw = pd.read_excel(BytesIO(data), header=None)
-    raw = raw.dropna(how="all")
-    if raw.empty:
-        return pd.DataFrame(columns=["codigo", "descripcion", "precio"])
+# =========================
+# ESTILO AC SOBRE FORMATO CORRECTO
+# =========================
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
 
-    # Detectar fila de encabezado posible.
-    header_row = None
-    for idx in range(min(10, len(raw))):
-        vals = [normalize_for_header(x) for x in raw.iloc[idx].tolist()]
-        has_desc = any(v in ["descripcion", "detalle", "producto", "articulo", "nombre"] for v in vals)
-        has_price = any(v in ["precio", "importe", "valor", "lista"] for v in vals)
-        if has_desc and has_price:
-            header_row = idx
-            break
+:root{
+    --ac-green:#36d6bb;
+    --ac-green-soft:#e6fff9;
+    --ac-black:#111111;
+    --ac-dark:#202020;
+    --ac-white:#ffffff;
+    --ac-red:#c51632;
+}
 
-    if header_row is not None:
-        dfh = pd.read_excel(BytesIO(data), header=header_row)
-        cols = list(dfh.columns)
-        code_col = find_col(cols, ["codigo", "cod", "code", "sku"])
-        desc_col = find_col(cols, ["descripcion", "detalle", "producto", "articulo", "nombre"])
-        price_col = find_col(cols, ["precio", "importe", "valor", "lista"])
-        if desc_col is not None and price_col is not None:
-            out = pd.DataFrame({
-                "codigo": dfh[code_col] if code_col is not None else "",
-                "descripcion": dfh[desc_col],
-                "precio": dfh[price_col],
-            })
-        else:
-            out = raw.iloc[:, :3].copy()
-            out.columns = ["codigo", "descripcion", "precio"]
-    else:
-        out = raw.iloc[:, :3].copy()
-        out.columns = ["codigo", "descripcion", "precio"]
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
 
-    out = out.dropna(subset=["descripcion"])
-    out["codigo"] = out["codigo"].astype(str).str.strip()
-    out["descripcion"] = out["descripcion"].astype(str).str.strip()
-    out["precio"] = parse_price_series(out["precio"])
-    out = out.dropna(subset=["precio"], how="all")
-    return out
+.stApp {
+    background: linear-gradient(180deg, #ffffff 0%, #f5f7f7 100%);
+    color: var(--ac-black);
+}
 
-def normalize_for_header(x):
-    t = str(x).strip().lower()
-    repl = {"á":"a","é":"e","í":"i","ó":"o","ú":"u","ñ":"n"}
-    for a,b in repl.items():
-        t = t.replace(a,b)
-    t = re.sub(r"[^a-z0-9]+", "", t)
-    return t
+.block-container {
+    max-width: 920px;
+    padding-top: 2.5rem;
+}
 
-def find_col(cols, names):
-    norm = [normalize_for_header(c) for c in cols]
-    for n in names:
-        nn = normalize_for_header(n)
-        for i, c in enumerate(norm):
-            if nn == c or nn in c:
-                return cols[i]
-    return None
+.ac-header{
+    display:flex;
+    align-items:center;
+    gap:18px;
+    margin-bottom:10px;
+}
 
-def parse_price_series(s):
-    def parse_one(x):
-        if pd.isna(x):
-            return pd.NA
-        if isinstance(x, (int, float)):
-            return float(x)
-        t = str(x).strip()
-        t = re.sub(r"[^0-9,\.\-]", "", t)
-        if not t:
-            return pd.NA
-        # Formatos AR: 1.234.567,89 o 123456,78
-        if "," in t and "." in t:
-            if t.rfind(",") > t.rfind("."):
-                t = t.replace(".", "").replace(",", ".")
-            else:
-                t = t.replace(",", "")
-        elif "," in t:
-            t = t.replace(".", "").replace(",", ".")
-        else:
-            # Si tiene muchos puntos, son separadores de miles.
-            if t.count(".") > 1:
-                t = t.replace(".", "")
-        try:
-            return float(t)
-        except Exception:
-            return pd.NA
-    return s.map(parse_one)
+.ac-logo{
+    width:82px;
+    height:82px;
+    border-radius:50%;
+    object-fit:cover;
+    box-shadow:0 8px 24px rgba(0,0,0,.18);
+    border:3px solid var(--ac-green);
+    background:#222;
+}
 
-@st.cache_data
-def load_excel_from_path(path: str):
-    with open(path, "rb") as f:
-        return load_excel_from_bytes(f.read())
+.ac-title-wrap h1{
+    margin:0 !important;
+    font-size:42px !important;
+    font-weight:800 !important;
+    color:#111 !important;
+    letter-spacing:-.8px;
+}
 
-def proveedor_from_filename(filename: str) -> str:
-    base = os.path.splitext(os.path.basename(filename))[0]
-    return base.replace("_", " ").replace("-", " ").strip() or base
+.ac-title-wrap p{
+    margin:7px 0 0 0;
+    color:#3b3b3b;
+    font-size:15px;
+}
 
-def load_price_lists():
-    listas = []
-    os.makedirs(LISTAS_DIR, exist_ok=True)
-    archivos = sorted([
-        os.path.join(LISTAS_DIR, f)
-        for f in os.listdir(LISTAS_DIR)
-        if f.lower().endswith((".xlsx", ".xls")) and not f.startswith("~$")
-    ])
-    for path in archivos:
-        try:
-            dfp = load_excel_from_path(path)
-            listas.append({"proveedor": proveedor_from_filename(path), "archivo": os.path.basename(path), "df": dfp})
-        except Exception as e:
-            st.warning(f"No pude cargar {os.path.basename(path)}: {e}")
-    return listas
+.ac-badge{
+    display:inline-block;
+    background:var(--ac-green);
+    color:#101010;
+    padding:6px 12px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:800;
+    margin-right:6px;
+    margin-bottom:8px;
+}
 
-def normalize(text: str) -> str:
-    text = str(text).upper()
-    repl = {"Á":"A","É":"E","Í":"I","Ó":"O","Ú":"U","Ñ":"N"}
-    for a, b in repl.items():
+.info-box {
+    background: linear-gradient(90deg, #e6fff9 0%, #f7fffd 100%);
+    border-radius: 12px;
+    padding: 14px 18px;
+    border-left: 6px solid var(--ac-green);
+    margin: 18px 0 22px 0;
+    color: #0b3c35;
+    font-weight: 700;
+}
+
+.count-box {
+    background: #ffffff;
+    border: 1px solid #e9eeee;
+    border-radius: 14px;
+    padding: 14px 18px;
+    margin: 18px 0;
+    color: #333333;
+    box-shadow:0 4px 16px rgba(0,0,0,.04);
+}
+
+.best-box {
+    background: linear-gradient(135deg, #e6fff9 0%, #ffffff 100%);
+    border: 2px solid var(--ac-green);
+    border-radius: 16px;
+    padding: 20px;
+    margin-top: 18px;
+    box-shadow:0 10px 28px rgba(54,214,187,.18);
+}
+
+.result-box {
+    background: #ffffff;
+    border-radius: 14px;
+    border: 1px solid #e9eeee;
+    padding: 18px;
+    margin-top: 18px;
+    box-shadow: 0 5px 20px rgba(0,0,0,0.05);
+}
+
+div.stButton > button {
+    background: var(--ac-red);
+    color: white;
+    border-radius: 10px;
+    border: none;
+    font-weight: 800;
+    padding: 0.65rem 1.15rem;
+    box-shadow:0 6px 16px rgba(197,22,50,.20);
+}
+
+div.stButton > button:hover {
+    background: #a91128;
+    color: white;
+}
+
+a {
+    color: #0f9f8b !important;
+    font-weight: 800;
+}
+
+h2, h3 {
+    color: #111111 !important;
+    font-weight: 800 !important;
+}
+
+.small-text {
+    font-size: 13px;
+    color: #555555;
+}
+
+.stSelectbox label, .stCheckbox label, .stTextInput label, .stFileUploader label {
+    color: #222 !important;
+    font-weight: 700;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================
+# HELPERS
+# =========================
+def normalize(text):
+    text = str(text).lower()
+    for a, b in {
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
+        "ñ": "n", "-": " ", "_": " ", "/": " ", ".": " "
+    }.items():
         text = text.replace(a, b)
-    text = re.sub(r"[^A-Z0-9 ]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-def year_to_full(y: int) -> int:
-    if y < 100:
-        return 2000 + y if y <= 35 else 1900 + y
-    return y
 
-def extract_years(text: str):
-    t = normalize(text)
+def parse_price(value):
+    if value is None or pd.isna(value):
+        return None
+    txt = str(value).replace("$", "").replace(" ", "").strip()
+    if "," in txt and "." in txt:
+        txt = txt.replace(".", "").replace(",", ".")
+    elif "," in txt:
+        txt = txt.replace(",", ".")
+    else:
+        if txt.count(".") >= 1:
+            txt = txt.replace(".", "")
+    try:
+        return float(txt)
+    except Exception:
+        return None
+
+
+def money(value):
+    try:
+        if value is None or pd.isna(value):
+            return "-"
+        n = float(value)
+        return "$ " + f"{n:,.0f}".replace(",", ".")
+    except Exception:
+        return str(value)
+
+
+def canonical_piece(tipo):
+    t = normalize(tipo)
+    if "parab" in t:
+        return "parabrisas"
+    if "luneta" in t:
+        return "luneta"
+    return "vidrio de puerta"
+
+
+def find_column(df, options):
+    cols = {normalize(c): c for c in df.columns}
+    for op in options:
+        opn = normalize(op)
+        for norm, original in cols.items():
+            if opn == norm or opn in norm:
+                return original
+    return None
+
+
+def brand_aliases(brand):
+    b = normalize(brand)
+    aliases = {
+        "ford": ["ford", "fo"],
+        "fiat": ["fiat", "fi"],
+        "volkswagen": ["volkswagen", "vw", "volks"],
+        "chevrolet": ["chevrolet", "ch", "chev", "gm"],
+        "renault": ["renault", "re"],
+        "peugeot": ["peugeot", "pe"],
+        "citroen": ["citroen", "ci"],
+        "toyota": ["toyota", "to"],
+        "nissan": ["nissan", "ni"],
+        "honda": ["honda", "ho"],
+    }
+    return aliases.get(b, [b])
+
+
+def extract_year_ranges(text):
+    d = normalize(text)
     ranges = []
-    for a, b in re.findall(r"\b(\d{2,4})\s*(?:A|AL|/|-)\s*(\d{2,4})\b", t):
-        aa, bb = year_to_full(int(a)), year_to_full(int(b))
-        if 1980 <= aa <= 2035 and 1980 <= bb <= 2035:
-            ranges.append((min(aa, bb), max(aa, bb)))
-    singles = []
-    for a in re.findall(r"\b(19\d{2}|20\d{2})\b", t):
-        aa = int(a)
-        if 1980 <= aa <= 2035:
-            singles.append(aa)
-    return ranges, singles
+    for pat in [r"(\d{2})\s*[-/]\s*(\d{2})", r"(\d{4})\s*[-/]\s*(\d{4})"]:
+        for m in re.finditer(pat, d):
+            a, b = m.groups()
+            a, b = int(a), int(b)
+            if a < 100:
+                a += 2000 if a < 40 else 1900
+            if b < 100:
+                b += 2000 if b < 40 else 1900
+            ranges.append((a, b))
+    return ranges
 
-def generation_score(desc: str, target_year: int | None, marca: str = "", modelo: str = "") -> int:
-    if not target_year:
-        return 0
-    desc_norm = normalize(desc)
-    ranges, singles = extract_years(desc_norm)
-    score = 0
-    for a, b in ranges:
-        if a <= target_year <= b:
-            score += 25
-        elif target_year > b:
-            score -= min(45, 12 + (target_year - b) * 2)
-        elif target_year < a:
-            score -= min(25, 5 + (a - target_year))
-    for y in singles:
-        if target_year >= y:
-            score += 12
-        else:
-            score -= min(20, (y - target_year) * 2)
-    modelo_norm = normalize(modelo)
-    if "ECOSPORT" in modelo_norm and target_year >= 2013:
-        if "KINETIC" in desc_norm or "2012" in desc_norm:
-            score += 35
-        if any(x in desc_norm for x in ["03 12", "2003 2012", "2010"]):
-            score -= 55
+
+def year_ok(desc, year):
+    if not year:
+        return True
+    try:
+        y = int(str(year)[:4])
+    except Exception:
+        return True
+    ranges = extract_year_ranges(desc)
+    if not ranges:
+        return True
+    return any(a <= y <= b for a, b in ranges)
+
+
+def piece_ok(desc, tipo):
+    d = normalize(desc)
+    p = canonical_piece(tipo)
+    if p == "parabrisas":
+        return any(x in d for x in ["parab", "parabrisa", "pbr", "psas"])
+    if p == "luneta":
+        return any(x in d for x in ["luneta", "lun", "ltas"])
+    return any(x in d for x in ["puerta", "lateral", "vidrio", "vde", "vdi", "dde", "ddi", "cristal"])
+
+
+def captor_ok(desc, filtro):
+    if filtro == "Todos":
+        return True
+    d = normalize(desc)
+    tiene = any(x in d for x in ["captor", "sensor", "lluvia", "rain"])
+    if filtro == "Con captor":
+        return tiene
+    if filtro == "Sin captor":
+        return not tiene
+    return True
+
+
+def vehicle_tokens(modelo):
+    bad = {"auto", "modelo", "version", "nuevo", "viejo"}
+    return [t for t in normalize(modelo).split() if len(t) >= 3 and t not in bad]
+
+
+def score_row(desc, marca, modelo, year, tipo, captor_filter):
+    d = normalize(desc)
+
+    if not piece_ok(d, tipo):
+        return -999
+
+    if canonical_piece(tipo) == "parabrisas" and not captor_ok(d, captor_filter):
+        return -999
+
+    aliases = brand_aliases(marca)
+    brand_match = any(re.search(rf"\b{re.escape(a)}\b", d) for a in aliases if a)
+    if marca and not brand_match:
+        return -999
+
+    tokens = vehicle_tokens(modelo)
+    if tokens:
+        model_matches = sum(1 for t in tokens if t in d)
+        if model_matches == 0:
+            return -999
+    else:
+        model_matches = 0
+
+    if not year_ok(d, year):
+        return -999
+
+    score = 30
+    score += 40 if brand_match else 0
+    score += model_matches * 40
+    score += 30 if year_ok(d, year) else 0
+    if extract_year_ranges(d):
+        score += 20
     return score
 
-def detect_car_with_ai(img_bytes: bytes, api_key: str, pieza: str) -> dict:
+
+@st.cache_data(show_spinner=False)
+def load_lists():
+    LISTAS_DIR.mkdir(exist_ok=True)
+    rows = []
+    for file in LISTAS_DIR.glob("*.xlsx"):
+        if file.name.lower() == "listas_colocacion.xlsx":
+            continue
+        proveedor = file.stem.replace("_", " ").replace("-", " ").title()
+        try:
+            excel = pd.ExcelFile(file)
+            for sheet in excel.sheet_names:
+                df = pd.read_excel(file, sheet_name=sheet)
+                if df.empty:
+                    continue
+                df.columns = [str(c).strip() for c in df.columns]
+                code_col = find_column(df, ["codigo", "cod", "item", "articulo"])
+                desc_col = find_column(df, ["descripcion", "detalle", "producto", "articulo", "nombre"])
+                price_col = find_column(df, ["precio", "importe", "valor", "lista"])
+
+                if desc_col is None:
+                    desc_col = df.columns[min(1, len(df.columns)-1)]
+
+                if price_col is None:
+                    candidates = []
+                    for c in df.columns:
+                        if df[c].apply(parse_price).notna().sum() > max(2, len(df) * 0.15):
+                            candidates.append(c)
+                    price_col = candidates[-1] if candidates else df.columns[-1]
+
+                for _, r in df.iterrows():
+                    desc = r.get(desc_col, "")
+                    price = parse_price(r.get(price_col, None))
+                    if not str(desc).strip() or price is None:
+                        continue
+                    rows.append({
+                        "proveedor": proveedor,
+                        "codigo": r.get(code_col, "") if code_col else "",
+                        "descripcion": str(desc),
+                        "precio": price,
+                        "archivo": file.name,
+                        "hoja": sheet
+                    })
+        except Exception as e:
+            st.warning(f"No pude leer {file.name}: {e}")
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def load_colocacion():
+    if not COLOCACION_FILE.exists():
+        return {}
+    try:
+        df = pd.read_excel(COLOCACION_FILE)
+        df.columns = [str(c).strip() for c in df.columns]
+        tipo_col = find_column(df, ["tipo", "pieza", "articulo", "vidrio"])
+        price_col = find_column(df, ["precio", "importe", "valor", "colocacion"])
+        if tipo_col is None or price_col is None:
+            return {}
+        out = {}
+        for _, r in df.iterrows():
+            tipo = canonical_piece(r.get(tipo_col, ""))
+            precio = parse_price(r.get(price_col, None))
+            if precio is not None:
+                out[tipo] = precio
+        return out
+    except Exception:
+        return {}
+
+
+def img_to_b64(uploaded):
+    image = Image.open(uploaded).convert("RGB")
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def detect_vehicle(uploaded, manual=""):
+    if manual.strip():
+        txt = manual.strip()
+        year = ""
+        m = re.search(r"(19|20)\d{2}", txt)
+        if m:
+            year = m.group(0)
+        parts = txt.replace(year, "").split()
+        marca = parts[0] if parts else ""
+        modelo = " ".join(parts[1:]) if len(parts) > 1 else txt
+        return {"marca": marca, "modelo": modelo, "anio": year, "detalle": txt}
+
+    api_key = st.secrets.get("OPENAI_API_KEY", "")
+    if not api_key:
+        st.error("Falta API Key fija. Cargá OPENAI_API_KEY en Secrets de Streamlit Cloud.")
+        return None
+
     client = OpenAI(api_key=api_key)
-    b64 = base64.b64encode(img_bytes).decode("utf-8")
-    prompt = f"""
-    Identifica el vehículo de la foto para buscar un vidrio automotor en una lista argentina.
-    La pieza que quiere el usuario es: {pieza}.
-    IMPORTANTE: distingue generación/años. No mezcles una generación vieja con una nueva.
-    Si detectás Ford EcoSport 2018-2022, agregá como términos de búsqueda: ECOSPORT 2012, ECOSPORT KINETIC, ECOSPORT 2012 KINETIC.
-    Devuelve SOLO JSON válido con estas claves:
-    marca, modelo, anio_estimado, generacion_o_anios, confianza, pieza_buscada, terminos_busqueda, excluir_terminos.
-    anio_estimado debe ser un número aproximado si podés, por ejemplo 2018.
-    terminos_busqueda debe ser una lista corta con palabras para buscar en Excel.
-    excluir_terminos debe incluir rangos/generaciones incorrectas si aplica, por ejemplo ["03-12", "2003-2012"] para una EcoSport 2018.
-    No inventes precio. Solo identifica el auto.
+    b64 = img_to_b64(uploaded)
+    prompt = """
+    Identificá el vehículo de la foto para buscar cristales.
+    Devolvé SOLO JSON válido:
+    {"marca":"", "modelo":"", "anio":"", "detalle":""}
+    Si no sabés año exacto, estimá año probable.
     """
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[{
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{
             "role": "user",
             "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
-            ],
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+            ]
         }],
+        temperature=0.1
     )
-    text = resp.output_text.strip()
-    text = text[text.find("{"): text.rfind("}") + 1]
-    return json.loads(text)
-
-def category_keywords(pieza: str):
-    if pieza == "Parabrisas":
-        return ["PSAS", "PARABRISAS", "PARABRISA"]
-    if pieza == "Luneta":
-        return ["LUNETA", "LUN"]
-    if pieza == "Vidrio de puerta / lateral":
-        return ["LATERAL", "LAT", "PUERTA", "PTA", "ALETA", "CUSTODIA", "VIDRIO"]
-    return []
-
-def filter_by_piece(df: pd.DataFrame, pieza: str):
-    kws = category_keywords(pieza)
-    if not kws:
-        return df.copy()
-    norm_desc = df["descripcion"].map(normalize)
-    mask = norm_desc.apply(lambda d: any(k in d.split() or k in d for k in kws))
-    return df[mask].copy()
-
-
-
-def brand_required_tokens(marca=""):
-    text = normalize(marca)
-    aliases = {
-        "FORD": ["FORD", "FO"],
-        "FIAT": ["FIAT", "FI"],
-        "CHEVROLET": ["CHEVROLET", "CHEV", "GM", "CH"],
-        "VOLKSWAGEN": ["VOLKSWAGEN", "VW", "V W"],
-        "RENAULT": ["RENAULT", "REN"],
-        "PEUGEOT": ["PEUGEOT", "PEU"],
-        "CITROEN": ["CITROEN", "CIT"],
-        "TOYOTA": ["TOYOTA", "TOY"],
-        "HONDA": ["HONDA"],
-        "NISSAN": ["NISSAN"],
-        "HYUNDAI": ["HYUNDAI"],
-        "KIA": ["KIA"],
-        "MERCEDES": ["MERCEDES", "MB", "M BENZ"],
-        "BMW": ["BMW"],
-        "AUDI": ["AUDI"],
+    content = response.choices[0].message.content.strip()
+    content = content.replace("```json", "").replace("```", "").strip()
+    data = json.loads(content)
+    return {
+        "marca": str(data.get("marca", "")).strip(),
+        "modelo": str(data.get("modelo", "")).strip(),
+        "anio": str(data.get("anio", "")).strip()[:4],
+        "detalle": str(data.get("detalle", "")).strip()
     }
-    for key, vals in aliases.items():
-        if key in text:
-            return vals
-    return [tok for tok in text.split() if len(tok) >= 3 and not tok.isdigit()]
 
-def contains_token(desc_norm: str, tokens):
-    if not tokens:
-        return True
-    padded = f" {desc_norm} "
-    for tok in tokens:
-        nt = normalize(tok)
-        # Para abreviaturas de marca como FO, FI, CH, exigir palabra/código separado.
-        if len(nt) <= 3:
-            if re.search(rf"(^|\s|-){{1}}{re.escape(nt)}($|\s|-)", desc_norm):
-                return True
-            if f" {nt} " in padded:
-                return True
-        elif nt in desc_norm:
-            return True
-    return False
 
-def year_strict_match(desc: str, target_year: int | None):
-    """Candado de año/generación.
-    - Si la descripción trae rango 17-23, el año debe caer dentro.
-    - Si trae un año único 2012, se acepta como 'desde 2012' hasta 15 años después.
-    - Si no trae año, se permite pero con menor score porque algunas listas no cargan años.
-    """
-    if not target_year:
-        return True, 0
-    ranges, singles = extract_years(desc)
-    if ranges:
-        return any(a <= target_year <= b for a, b in ranges), 0
-    if singles:
-        ok = any(y <= target_year <= y + 15 for y in singles)
-        return ok, (8 if ok else 0)
-    return True, -10
-
-def model_required_tokens(marca="", modelo=""):
-    """Devuelve tokens que tienen que aparecer sí o sí para evitar falsos positivos.
-    Ej: si detecta EcoSport, no puede devolver Corsa o Fiat Uno.
-    """
-    text = normalize(f"{marca} {modelo}")
-    tokens = []
-    # Alias frecuentes en listas argentinas
-    aliases = {
-        "ECOSPORT": ["ECOSPORT", "ECO SPORT"],
-        "DUNA": ["DUNA"],
-        "UNO": ["UNO"],
-        "TORO": ["TORO"],
-        "GOL": ["GOL"],
-        "GOL TREND": ["GOL TREND", "TREND"],
-        "FIESTA": ["FIESTA"],
-        "FOCUS": ["FOCUS"],
-        "CORSA": ["CORSA"],
-        "ONIX": ["ONIX"],
-        "KA": [" KA ", "FORD KA"],
-        "RANGER": ["RANGER"],
-        "S10": ["S10", "S 10"],
-        "AMAROK": ["AMAROK"],
-        "HILUX": ["HILUX"],
-        "KANGOO": ["KANGOO"],
-        "PARTNER": ["PARTNER"],
-        "BERLINGO": ["BERLINGO"],
-        "PALIO": ["PALIO"],
-        "SIENA": ["SIENA"],
-        "CRONOS": ["CRONOS"],
-        "ARGO": ["ARGO"],
-    }
-    for key, vals in aliases.items():
-        if key in text:
-            tokens.extend(vals)
-    # Si no detectó alias, usar palabras del modelo que no sean marca/año y tengan largo razonable.
-    if not tokens:
-        bad = {"FORD","FIAT","CHEVROLET","VW","VOLKSWAGEN","RENAULT","PEUGEOT","CITROEN","TOYOTA","HONDA","NISSAN","HYUNDAI","KIA","MERCEDES","BENZ","AUDI","BMW"}
-        for tok in text.split():
-            if tok not in bad and len(tok) >= 4 and not tok.isdigit():
-                tokens.append(tok)
-    return list(dict.fromkeys(tokens))
-
-def contains_required_model(desc_norm: str, required_tokens):
-    if not required_tokens:
-        return True
-    padded = f" {desc_norm} "
-    for tok in required_tokens:
-        nt = normalize(tok)
-        # tokens con espacios al principio/final son buscados como palabra exacta
-        if tok.startswith(" ") or tok.endswith(" "):
-            if nt in padded:
-                return True
-        elif nt in desc_norm:
-            return True
-    return False
-
-def search_prices(df: pd.DataFrame, terms, pieza: str, target_year=None, marca="", modelo="", exclude_terms=None, min_score=82):
-    df_piece = filter_by_piece(df, pieza)
-    if df_piece.empty:
-        df_piece = df.copy()
-    norm_desc = df_piece["descripcion"].map(normalize)
-    clean_terms = [normalize(t) for t in terms if str(t).strip()]
-    excludes = [normalize(t) for t in (exclude_terms or []) if str(t).strip()]
-
-    # CANDADOS OBLIGATORIOS: marca + modelo + año/generación.
-    brand_tokens = brand_required_tokens(marca)
-    model_tokens = model_required_tokens(marca, modelo)
-
+def search(df, vehicle, tipo, captor_filter):
     rows = []
-    for idx, desc_norm in norm_desc.items():
-        if not clean_terms:
-            continue
+    for _, r in df.iterrows():
+        s = score_row(
+            r["descripcion"],
+            vehicle.get("marca", ""),
+            vehicle.get("modelo", ""),
+            vehicle.get("anio", ""),
+            tipo,
+            captor_filter
+        )
+        if s > 0:
+            item = r.to_dict()
+            item["coincidencia"] = s
+            rows.append(item)
 
-        # 1) Marca obligatoria: FORD/FO, FIAT/FI, CHEVROLET/CH, etc.
-        if marca and not contains_token(desc_norm, brand_tokens):
-            continue
-
-        # 2) Modelo obligatorio: si detecta ECOSPORT, la descripción debe decir ECOSPORT.
-        if not contains_required_model(desc_norm, model_tokens):
-            continue
-
-        # 3) Año/generación obligatorio cuando el artículo trae rango/año.
-        year_ok, year_bonus = year_strict_match(desc_norm, target_year)
-        if not year_ok:
-            continue
-
-        base = max(fuzz.token_set_ratio(t, desc_norm) for t in clean_terms)
-        if any(t and t in desc_norm for t in clean_terms):
-            base = min(100, base + 7)
-        if model_tokens and contains_required_model(desc_norm, model_tokens):
-            base = min(100, base + 12)
-        if marca and contains_token(desc_norm, brand_tokens):
-            base = min(100, base + 8)
-
-        gen = generation_score(desc_norm, target_year, marca, modelo) + year_bonus
-        penalty = 0
-        if any(e and e in desc_norm for e in excludes):
-            penalty -= 45
-        final = max(0, min(100, int(base + gen + penalty)))
-        if final >= min_score:
-            r = df_piece.loc[idx].to_dict()
-            r["coincidencia"] = final
-            r["base_texto"] = int(base)
-            r["ajuste_anio"] = int(gen + penalty)
-            rows.append(r)
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values(["coincidencia", "base_texto", "precio"], ascending=[False, False, True]).head(15)
+    return out.sort_values(["precio", "coincidencia"], ascending=[True, False])
 
-def search_all_lists(listas, terms, pieza, target_year=None, marca="", modelo="", exclude_terms=None):
-    todos = []
-    resumen = []
-    for item in listas:
-        proveedor = item["proveedor"] or item["archivo"]
-        results = search_prices(item["df"], terms, pieza, target_year, marca, modelo, exclude_terms)
-        if not results.empty:
-            results = results.copy()
-            results.insert(0, "proveedor", proveedor)
-            results.insert(1, "archivo", item["archivo"])
-            todos.append(results)
-            best = results.iloc[0].to_dict()
-            resumen.append(best)
-    all_df = pd.concat(todos, ignore_index=True) if todos else pd.DataFrame()
-    resumen_df = pd.DataFrame(resumen)
-    if not resumen_df.empty:
-        resumen_df = resumen_df.sort_values(["precio", "coincidencia"], ascending=[True, False])
-    if not all_df.empty:
-        all_df = all_df.sort_values(["precio", "coincidencia"], ascending=[True, False])
-    return resumen_df, all_df
 
-def format_price(x):
-    return f"$ {x:,.0f}".replace(",", ".") if pd.notna(x) else ""
+def whatsapp_url(tipo, precio_cristal, colocacion, total):
+    pieza = canonical_piece(tipo)
+    if colocacion:
+        msg = (
+            f"Hola! 👋\n\n"
+            f"Te paso el precio del artículo {pieza} que solicitaste.\n\n"
+            f"🪟 Cristal: {money(precio_cristal)}\n"
+            f"🔧 Colocación: {money(colocacion)}\n"
+            f"💰 Total final: {money(total)}\n\n"
+            f"Cualquier consulta, estamos a disposición 😊\n"
+            f"🔧 Autopartes Centro"
+        )
+    else:
+        msg = (
+            f"Hola! 👋\n\n"
+            f"Te paso el precio del artículo {pieza} que solicitaste, {money(precio_cristal)}.\n\n"
+            f"Cualquier consulta, estamos a disposición 😊\n"
+            f"🔧 Autopartes Centro"
+        )
+    return f"https://wa.me/{WHATSAPP_NUMERO}?text={urllib.parse.quote(msg)}"
 
-def show_results(resumen_df, all_df, pieza, auto_txt):
-    st.subheader("🏆 Mejor precio por proveedor")
-    if resumen_df.empty:
-        st.warning("No encontré coincidencias claras en ninguna lista.")
-        return
-    show = resumen_df.copy()
-    show["precio"] = show["precio"].map(format_price)
-    cols = ["proveedor", "codigo", "descripcion", "precio", "coincidencia", "ajuste_anio"]
-    st.dataframe(show[cols], use_container_width=True, hide_index=True)
 
-    best = resumen_df.iloc[0]
-    st.success(f"Mejor precio: {best['proveedor']} — {best['codigo']} — {best['descripcion']} — {format_price(best['precio'])}")
-
-    with st.expander("Ver todas las coincidencias de todas las listas"):
-        all_show = all_df.copy()
-        all_show["precio"] = all_show["precio"].map(format_price)
-        st.dataframe(all_show[["proveedor", "codigo", "descripcion", "precio", "coincidencia", "ajuste_anio"]], use_container_width=True, hide_index=True)
-
-    mensaje = f"Hola! Mejor precio encontrado: {pieza} para {auto_txt}. Proveedor: {best['proveedor']}. Código {best['codigo']} - {best['descripcion']} - {format_price(best['precio'])}."
-    link = "https://wa.me/?text=" + urllib.parse.quote(mensaje)
-    st.markdown(f"[📲 Enviar mejor precio por WhatsApp]({link})")
-
-listas = load_price_lists()
-if listas:
-    total_productos = sum(len(x["df"]) for x in listas)
-    st.info(f"Listas fijas cargadas: {len(listas)} proveedor(es) / {total_productos} productos en total")
-    with st.expander("Ver proveedores cargados"):
-        for x in listas:
-            st.write(f"• **{x['proveedor']}** — {x['archivo']} — {len(x['df'])} productos")
+# =========================
+# INTERFAZ
+# =========================
+if LOGO_PATH.exists():
+    logo_b64 = base64.b64encode(LOGO_PATH.read_bytes()).decode()
+    logo_html = f'<img class="ac-logo" src="data:image/jpeg;base64,{logo_b64}" />'
 else:
-    st.error("No hay ninguna lista fija cargada. Copiá tus Excel dentro de la carpeta listas_precios y reiniciá la app.")
+    logo_html = '<div class="ac-logo"></div>'
 
-col1, col2 = st.columns(2)
-with col1:
-    buscar = st.button("🔎 Detectar auto y comparar precios", type="primary", disabled=not image_file or not listas)
-with col2:
-    if st.button("🔄 Nueva búsqueda"):
-        st.rerun()
+st.markdown(
+    f"""
+    <div class="ac-header">
+        {logo_html}
+        <div class="ac-title-wrap">
+            <div>
+                <span class="ac-badge">🚘 IA VIDRIOS</span>
+                <span class="ac-badge">🔧 AUTOPARTES CENTRO</span>
+            </div>
+            <h1>Buscador IA de vidrios</h1>
+            <p>Sacá o subí una foto, elegí el tipo de vidrio y compará precios entre proveedores ya cargados.</p>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown('<div class="info-box">🌐 Versión online lista: usá cámara o subí foto desde el celular.</div>', unsafe_allow_html=True)
+
+tipo = st.selectbox("¿Qué querés buscar?", ["Parabrisas", "Luneta", "Vidrio de puerta"])
+
+captor_filter = "Todos"
+if canonical_piece(tipo) == "parabrisas":
+    captor_filter = st.selectbox("Sensor / captor", ["Todos", "Con captor", "Sin captor"])
+
+agregar_colocacion = st.checkbox("🔧 Agregar colocación", value=False)
+
+st.header("📋 Listas de precios fijas")
+st.caption("La app carga automáticamente todos los Excel que estén dentro de la carpeta `listas_precios`. El nombre del archivo se usa como nombre del proveedor.")
+
+df_prices = load_lists()
+colocaciones = load_colocacion()
+
+proveedores = 0 if df_prices.empty else df_prices["proveedor"].nunique()
+productos = 0 if df_prices.empty else len(df_prices)
+
+st.markdown(f'<div class="count-box">Listas fijas cargadas: <b>{proveedores} proveedor(es)</b> / <b>{productos} productos</b> en total</div>', unsafe_allow_html=True)
+
+with st.expander("Ver proveedores cargados"):
+    if df_prices.empty:
+        st.warning("Todavía no hay listas cargadas.")
+    else:
+        for p in sorted(df_prices["proveedor"].unique()):
+            st.write(f"🏪 {p}")
+
+st.subheader("Foto del auto")
+
+modo = st.radio("", ["Subir foto", "Sacar foto con cámara"], horizontal=True)
+
+foto = None
+if modo == "Subir foto":
+    foto = st.file_uploader("Subí una foto del auto", type=["jpg", "jpeg", "png"])
+else:
+    foto = st.camera_input("Sacá una foto del auto")
+
+manual = st.text_input("Búsqueda manual opcional", placeholder="Ej: Ford EcoSport 2018")
+
+col_a, col_b = st.columns([1, 1])
+with col_a:
+    buscar = st.button("🔎 Detectar auto y comparar precios")
+with col_b:
+    nueva = st.button("🔄 Nueva búsqueda")
+
+if nueva:
+    st.rerun()
+
+if foto:
+    st.image(foto, caption="Foto cargada", use_container_width=True)
 
 if buscar:
-    if not api_key:
-        st.error("Falta la OpenAI API Key para que la IA pueda leer la foto.")
+    if df_prices.empty:
+        st.error("No hay listas de precios cargadas.")
         st.stop()
-    img_bytes = image_file.getvalue()
-    st.image(img_bytes, caption="Foto cargada", use_container_width=True)
 
-    with st.spinner("Detectando auto con IA..."):
-        car = detect_car_with_ai(img_bytes, api_key, pieza)
+    if not foto and not manual.strip():
+        st.error("Subí una foto o escribí una búsqueda manual.")
+        st.stop()
 
-    st.subheader("Auto detectado")
-    marca = car.get("marca", "")
-    modelo = car.get("modelo", "")
-    auto_txt = f"{marca} {modelo}".strip()
-    target_year = car.get("anio_estimado")
-    try:
-        target_year = int(target_year) if target_year else None
-    except Exception:
-        target_year = None
+    with st.spinner("Detectando auto y buscando coincidencias..."):
+        vehicle = detect_vehicle(foto, manual)
 
-    st.write(f"**{auto_txt}** — {car.get('generacion_o_anios','')}")
-    st.write(f"Año estimado: **{target_year or 'sin dato'}**")
-    st.write(f"Pieza: **{pieza}**")
-    st.write(f"Confianza: **{car.get('confianza','')}**")
+    if not vehicle:
+        st.stop()
 
-    terms = car.get("terminos_busqueda", []) + [auto_txt, modelo]
-    exclude_terms = car.get("excluir_terminos", [])
-    with st.spinner("Buscando en todas las listas y comparando precios..."):
-        resumen_df, all_df = search_all_lists(listas, terms, pieza, target_year, marca, modelo, exclude_terms)
-    show_results(resumen_df, all_df, pieza, auto_txt)
+    st.markdown("### 🔍 Búsqueda manual")
+    st.write(f"**{vehicle.get('marca','')} {vehicle.get('modelo','')} — {vehicle.get('anio','')}**")
+    st.write(f"**Pieza:** {tipo}")
 
-st.divider()
-st.subheader("🔍 Búsqueda manual")
-st.caption("Usala si querés buscar sin foto, corregir el modelo o comparar un artículo directo.")
-col_a, col_b = st.columns(2)
-with col_a:
-    manual = st.text_input("Marca/modelo o palabra clave", placeholder="Ej: FORD ECOSPORT")
-with col_b:
-    manual_year = st.number_input("Año aprox. (opcional)", min_value=1980, max_value=2035, value=None, step=1)
-if manual and listas:
-    resumen_df, all_df = search_all_lists(listas, [manual], pieza, manual_year, "", manual, [])
-    show_results(resumen_df, all_df, pieza, manual)
+    results = search(df_prices, vehicle, tipo, captor_filter)
 
-st.caption("Tip: para comparar proveedores, subí todos los Excel y poné nombres como: Pilkington, XYG, proveedor Córdoba, proveedor Buenos Aires, etc.")
+    if results.empty:
+        st.error("No encontré coincidencias exactas por marca + modelo + año. Probá búsqueda manual o revisá cómo aparece cargado en los Excel.")
+        st.stop()
+
+    best = results.iloc[0].to_dict()
+    precio_cristal = best["precio"]
+    colocacion = 0
+
+    if agregar_colocacion:
+        colocacion = colocaciones.get(canonical_piece(tipo), 0)
+        if colocacion == 0:
+            st.warning("Colocación activada, pero todavía falta cargar `listas_colocacion.xlsx` con precios.")
+
+    total = precio_cristal + colocacion
+    wa = whatsapp_url(tipo, precio_cristal, colocacion, total)
+
+    st.markdown('<div class="best-box">', unsafe_allow_html=True)
+    st.markdown("### 🏆 Mejor precio encontrado")
+    st.write(f"🏪 **Proveedor:** {best.get('proveedor','')}")
+    st.write(f"🔢 **Código:** {best.get('codigo','')}")
+    st.write(f"📝 **Descripción:** {best.get('descripcion','')}")
+    st.write(f"🪟 **Cristal:** {money(precio_cristal)}")
+    st.write(f"🔧 **Colocación:** {money(colocacion) if colocacion else 'No incluida'}")
+    st.write(f"💰 **Total final:** {money(total)}")
+    st.markdown(f"[📲 Enviar cotización por WhatsApp]({wa})")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("### Resultados en la lista")
+    show = results.head(20).copy()
+    show["precio"] = show["precio"].apply(money)
+    st.dataframe(
+        show[["proveedor", "codigo", "descripcion", "precio", "coincidencia"]],
+        use_container_width=True,
+        hide_index=True
+    )
